@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-// 消息类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum MessageType {
@@ -20,7 +21,6 @@ enum MessageType {
     TypingIndicator,
 }
 
-// WebSocket 消息结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WebSocketMessage {
@@ -37,10 +37,20 @@ struct WebSocketMessage {
     timestamp: String,
 }
 
-// 用户连接映射：用户ID -> 发送通道
-type UserConnections = HashMap<String, tokio::sync::mpsc::UnboundedSender<Message>>;
+struct UserConnection {
+    sender: mpsc::UnboundedSender<Message>,
+    last_ping: Instant,
+}
 
-// 服务器状态
+type UserConnections = HashMap<String, UserConnection>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserOnlineStatus {
+    user_id: String,
+    status: String,
+    timestamp: String,
+}
+
 struct ServerState {
     connections: RwLock<UserConnections>,
 }
@@ -52,40 +62,55 @@ impl ServerState {
         }
     }
 
-    // 添加用户连接
-    async fn add_user(&self, user_id: String, sender: tokio::sync::mpsc::UnboundedSender<Message>) {
+    async fn add_user(&self, user_id: String, sender: mpsc::UnboundedSender<Message>) {
         let mut connections = self.connections.write().await;
         
-        if connections.contains_key(&user_id) {
+        let was_online = connections.contains_key(&user_id);
+        
+        connections.insert(user_id.clone(), UserConnection {
+            sender,
+            last_ping: Instant::now(),
+        });
+        
+        if was_online {
             info!("User {} reconnected, replacing existing connection", user_id);
         } else {
             info!("User {} connected", user_id);
+            drop(connections);
+            self.broadcast_user_status(&user_id, "online").await;
         }
-        
-        connections.insert(user_id, sender);
     }
 
-    // 移除用户连接
     async fn remove_user(&self, user_id: &str) {
         let mut connections = self.connections.write().await;
         if connections.remove(user_id).is_some() {
             info!("User {} disconnected", user_id);
+            drop(connections); 
+            self.broadcast_user_status(user_id, "offline").await;
         }
     }
 
-    // 获取在线用户列表
+    async fn update_ping(&self, user_id: &str) {
+        let mut connections = self.connections.write().await;
+        if let Some(conn) = connections.get_mut(user_id) {
+            conn.last_ping = Instant::now();
+        }
+    }
+
     async fn get_online_users(&self) -> Vec<String> {
         let connections = self.connections.read().await;
         connections.keys().cloned().collect()
     }
 
-    // 向特定用户发送消息
     async fn send_to_user(&self, user_id: &str, message: &str) -> bool {
         let connections = self.connections.read().await;
         
-        if let Some(sender) = connections.get(user_id) {
-            match sender.send(Message::Text(message.to_string())) {
-                Ok(_) => true,
+        if let Some(conn) = connections.get(user_id) {
+            match conn.sender.send(Message::Text(message.to_string())) {
+                Ok(_) => {
+                    debug!("Message sent to user {}", user_id);
+                    true
+                },
                 Err(e) => {
                     error!("Failed to send message to user {}: {}", user_id, e);
                     false
@@ -96,28 +121,69 @@ impl ServerState {
             false
         }
     }
+
+    async fn broadcast_user_status(&self, user_id: &str, status: &str) {
+        let status_message = UserOnlineStatus {
+            user_id: user_id.to_string(),
+            status: status.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        
+        let json_message = serde_json::to_string(&status_message).unwrap_or_default();
+        
+        // 这里简化为向所有人广播
+        let online_users = self.get_online_users().await;
+        for online_user in online_users {
+            if online_user != user_id {
+                self.send_to_user(&online_user, &json_message).await;
+            }
+        }
+    }
+
+    async fn cleanup_inactive_connections(&self) {
+        let mut to_remove = Vec::new();
+        
+        {
+            let connections = self.connections.read().await;
+            let now = Instant::now();
+            for (user_id, conn) in connections.iter() {
+                if now.duration_since(conn.last_ping) > Duration::from_secs(60) {
+                    warn!("User {} connection timed out", user_id);
+                    to_remove.push(user_id.clone());
+                }
+            }
+        }
+        
+        for user_id in to_remove {
+            self.remove_user(&user_id).await;
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志
     tracing_subscriber::fmt::init();
     
-    // 创建服务器状态
     let state = Arc::new(ServerState::new());
     
-    // 监听地址
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            cleanup_state.cleanup_inactive_connections().await;
+        }
+    });
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{}", port);
     let addr_use_for_print = addr.clone();
     let listener = TcpListener::bind(addr).await.expect("Failed to bind to address");
-    info!("WebSocket server listening on: {}", addr_use_for_print.clone());
+    info!("SmartLink WebSocket server listening on: {}", addr_use_for_print);
 
-    // 接受连接
     while let Ok((stream, addr)) = listener.accept().await {
         info!("Incoming connection from: {}", addr);
         
-        // 为每个连接创建一个任务
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, addr, state).await {
@@ -136,9 +202,8 @@ async fn handle_connection(
     debug!("WebSocket connection established: {}", addr);
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     
-    // 启动发送任务
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Err(e) = ws_sender.send(msg).await {
@@ -149,7 +214,6 @@ async fn handle_connection(
         debug!("Send task for {} terminated", addr);
     });
     
-    // 等待第一条消息来识别用户
     let mut user_id = String::new();
     
     if let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
@@ -160,7 +224,6 @@ async fn handle_connection(
                     info!("User authenticated: {}", user_id);
                     state.add_user(user_id.clone(), tx.clone()).await;
                     
-                    // 通知用户已连接成功
                     let response = serde_json::json!({
                         "message_type": "UserStatus",
                         "sender_id": "system",
@@ -187,33 +250,33 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // 主消息处理循环
     while let Some(result) = ws_receiver.next().await {
         match result {
             Ok(Message::Text(text)) => {
+                state.update_ping(&user_id).await;
+                
                 process_message(text, &user_id, &state).await?;
             }
             Ok(Message::Ping(data)) => {
+                state.update_ping(&user_id).await;
+                
                 tx.send(Message::Pong(data))?;
             }
             Ok(Message::Pong(_)) => {
-                // 忽略 Pong 响应
+                state.update_ping(&user_id).await;
             }
             Ok(Message::Close(_)) => {
                 info!("Client {} requested close", addr);
                 break;
             }
-            Ok(_) => {
-                // 忽略其他类型的消息
-            }
             Err(e) => {
                 error!("WebSocket error: {}", e);
                 break;
             }
+            _ => {}
         }
     }
 
-    // 断开连接后清理
     state.remove_user(&user_id).await;
     info!("Connection closed: {}", addr);
     
@@ -237,12 +300,11 @@ async fn process_message(
     
     match message.message_type {
         MessageType::NewMessage => {
-            // 处理新消息
+            info!("New message from {}", sender_id);
+            
             if let Some(recipient_id) = &message.recipient_id {
-                // 直接消息
                 state.send_to_user(recipient_id, &text).await;
             } else if let Some(conversation_id) = &message.conversation_id {
-                // 群组消息 - 需要获取所有参与者并转发
                 if let Some(data) = &message.data {
                     if let Some(recipients) = data.get("recipients").and_then(|r| r.as_array()) {
                         for recipient in recipients {
@@ -257,28 +319,30 @@ async fn process_message(
             }
         }
         MessageType::MessageStatusUpdate => {
-            // 处理消息状态更新
             if let Some(recipient_id) = &message.recipient_id {
+                info!("Message status update for message: {:?}", message.message_id);
                 state.send_to_user(recipient_id, &text).await;
             }
         }
         MessageType::WebRTCSignal => {
-            // 处理WebRTC信令
             if let Some(recipient_id) = &message.recipient_id {
+                info!("WebRTC signal from {} to {}", sender_id, recipient_id);
                 state.send_to_user(recipient_id, &text).await;
             }
         }
         MessageType::TypingIndicator => {
-            // 处理输入状态指示器
             if let Some(recipient_id) = &message.recipient_id {
+                debug!("Typing indicator from {} to {}", sender_id, recipient_id);
                 state.send_to_user(recipient_id, &text).await;
-            } else if let Some(data) = &message.data {
-                // 群组输入指示
-                if let Some(recipients) = data.get("recipients").and_then(|r| r.as_array()) {
-                    for recipient in recipients {
-                        if let Some(recipient_id) = recipient.as_str() {
-                            if recipient_id != sender_id {
-                                state.send_to_user(recipient_id, &text).await;
+            } else if let Some(conversation_id) = &message.conversation_id {
+                debug!("Group typing indicator from {} in {}", sender_id, conversation_id);
+                if let Some(data) = &message.data {
+                    if let Some(recipients) = data.get("recipients").and_then(|r| r.as_array()) {
+                        for recipient in recipients {
+                            if let Some(recipient_id) = recipient.as_str() {
+                                if recipient_id != sender_id {
+                                    state.send_to_user(recipient_id, &text).await;
+                                }
                             }
                         }
                     }
@@ -286,8 +350,11 @@ async fn process_message(
             }
         }
         MessageType::UserStatus => {
-            // 用户状态更新，可能是上线/下线通知
-            // 我们可以将状态变更广播给好友，但这个简单实现中忽略
+            if let Some(data) = &message.data {
+                if let Some(status) = data.get("status").and_then(|s| s.as_str()) {
+                    info!("User {} status changed to {}", sender_id, status);
+                }
+            }
         }
     }
     
