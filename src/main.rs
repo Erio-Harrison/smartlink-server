@@ -19,6 +19,11 @@ enum MessageType {
     MessageStatusUpdate,
     WebRTCSignal,
     TypingIndicator,
+    NewMoment,          
+    MomentLike,          
+    MomentComment,    
+    MomentUpdate,     
+    MomentDelete, 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +361,46 @@ async fn process_message(
                 }
             }
         }
+
+        MessageType::NewMoment => {
+            info!("New moment published by {}", sender_id);
+            
+                        if let Some(data) = &message.data {
+                if let Some(friends) = data.get("friends").and_then(|f| f.as_array()) {
+                    for friend in friends {
+                        if let Some(friend_id) = friend.as_str() {
+                            if friend_id != sender_id {
+                                state.send_to_user(friend_id, &text).await;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        MessageType::MomentLike | MessageType::MomentComment => {
+            info!("Moment interaction from {}: {:?}", sender_id, message.message_type);
+            
+            if let Some(recipient_id) = &message.recipient_id {
+                if recipient_id != sender_id {
+                    state.send_to_user(recipient_id, &text).await;
+                }
+            }
+        },
+        MessageType::MomentUpdate | MessageType::MomentDelete => {
+            info!("Moment updated/deleted by {}", sender_id);
+            
+            if let Some(data) = &message.data {
+                if let Some(viewers) = data.get("viewers").and_then(|v| v.as_array()) {
+                    for viewer in viewers {
+                        if let Some(viewer_id) = viewer.as_str() {
+                            if viewer_id != sender_id {
+                                state.send_to_user(viewer_id, &text).await;
+                            }
+                        }
+                    }
+                }
+            }
+        },
     }
     
     Ok(())
